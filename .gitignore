@@ -1,0 +1,31 @@
+﻿# Python virtual environment
+myenv/
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables (keep local, never push)
+.env
+
+# Node dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# ML data (too large for git)
+ml/data/raw/
+ml/data/processed/
+ml/models/
+
+# OS files
+.DS_Store
+Thumbs.db
