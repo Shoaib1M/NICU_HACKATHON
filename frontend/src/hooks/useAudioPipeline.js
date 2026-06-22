@@ -105,7 +105,7 @@ export function useAudioPipeline(incubatorId = 'BAY_03') {
     const freqBin = new Uint8Array(analyserRef.current.frequencyBinCount);
     analyserRef.current.getByteFrequencyData(freqBin);
     const avgBin = freqBin.reduce((a, b) => a + b, 0) / freqBin.length;
-    const db = Math.round(30 + (avgBin / 255) * 60); // map [0,255] → [30,90]
+    const db = Math.round(20 + (avgBin / 255) * 45); // map [0,255] → [20,65]
     setDbLevel(db);
 
     // 2. Grab latest PCM chunk

@@ -18,6 +18,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from services.stress_index import StressIndexAccumulator, compute_stress_index
 from database.queries import insert_stress_event, insert_alert
+from agents.escalation_agent import escalation_agent
 
 router = APIRouter()
 
@@ -129,6 +130,16 @@ async def audio_ingest(ws: WebSocket) -> None:
                 "motion_score":    motion_score,
             }
             asyncio.create_task(broadcast(outbound))
+
+            # ── Feature 2: Escalation agent check ────────────────────────
+            asyncio.create_task(
+                escalation_agent.check(
+                    bay=bay,
+                    smoothed_stress=smoothed,
+                    classifications=clf,
+                    db_level=db_level,
+                )
+            )
 
     except WebSocketDisconnect:
         print(f"🎙️  Audio WebSocket disconnected ({bay})")

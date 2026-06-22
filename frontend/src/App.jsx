@@ -20,7 +20,7 @@ import StressIndexMeter from './components/AudioPipeline/StressIndexMeter';
 
 // Dashboard panels (Phase 0 — already built, imported from feature branch)
 // import IncubatorMap  from './components/Dashboard/IncubatorMap';
-// import AlertFeed     from './components/Dashboard/AlertFeed';
+import AlertFeed     from './components/Dashboard/AlertFeed';
 // import ShiftReport   from './components/Dashboard/ShiftReport';
 
 const MONITORED_BAY = 'BAY_03';
@@ -101,12 +101,15 @@ export default function App() {
           </div>
 
           {/* right: live gauge + timeline */}
-          <StressIndexMeter
-            value={stressData.stressIndex}
-            history={history}
-            trend={stressData.trend}
-            incubatorId={MONITORED_BAY}
-          />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <StressIndexMeter
+              value={stressData.stressIndex}
+              history={history}
+              trend={stressData.trend}
+              incubatorId={MONITORED_BAY}
+            />
+            <AlertFeed />
+          </div>
         </div>
 
         {/* placeholder for upcoming phases */}

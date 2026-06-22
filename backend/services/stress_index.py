@@ -16,8 +16,8 @@ import numpy as np
 
 # ── calibration constants ─────────────────────────────────────────────────────
 
-DB_MIN: float = 30.0   # quiet baseline (below typical NICU ambient)
-DB_MAX: float = 90.0   # loud alarm/cry ceiling
+DB_MIN: float = 20.0   # lowered for sensitivity — quieter sounds register higher
+DB_MAX: float = 65.0   # lowered ceiling for demo/hackathon testing
 
 W_DB:      float = 0.40
 W_CRY:     float = 0.35

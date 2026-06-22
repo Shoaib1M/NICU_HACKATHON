@@ -12,8 +12,8 @@
  *   low  motion + high cry  → ×0.85   likely false positive
  */
 
-const DB_MIN = 30;
-const DB_MAX = 90;
+const DB_MIN = 20;
+const DB_MAX = 65;
 
 const W = { db: 0.40, cry: 0.35, alarm: 0.15, ambient: 0.10 };
 

@@ -10,18 +10,31 @@ import sys
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database.mongo import connect_db, close_db
 from routers import audio, visual, alerts, reports
+from agents.prediction_agent import prediction_agent
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
+
+    # Start the prediction agent background task (Feature 4)
+    prediction_task = asyncio.create_task(prediction_agent.run_loop())
+
     yield
+
+    # Graceful shutdown
+    prediction_task.cancel()
+    try:
+        await prediction_task
+    except asyncio.CancelledError:
+        pass
     await close_db()
 
 
