@@ -1,44 +1,61 @@
 /**
  * App.jsx — NICU Guardian
  *
- * Root component. Wires the audio pipeline into the dashboard.
- * Visual pipeline, agent alerts, and advanced panels are built in subsequent phases.
+ * Root component. Wires audio + visual pipelines and all dashboard panels.
  *
  * Build phases completed:
- *   ✅ Phase 0 — Dashboard UI (light mode)
- *   ✅ Phase 1 — Audio Pipeline  ← current
- *   ⬜ Phase 2 — Groq Agents (escalation, root cause, occupancy)
- *   ⬜ Phase 3 — Visual Pipeline (occupancy, agitation, TDOA, nurse tracker)
- *   ⬜ Phase 4 — Parent presence, shift memory agent
+ *   ✅ Phase 1 — Audio Pipeline (mic → YAMNet → stress → WebSocket)
+ *   ✅ Phase 2 — Groq Agents (escalation, root cause, prediction)
+ *   ✅ Phase 3 — Visual Pipeline (camera → MediaPipe → occupancy/motion/nurse)
+ *   ✅ Phase 4 — Parent Presence, Shift Memory Agent
  */
 
 import { useState, useCallback } from 'react';
 
+// Phase 1 — Audio Pipeline
 import AudioCapture    from './components/AudioPipeline/AudioCapture';
 import YAMNetClassifier from './components/AudioPipeline/YAMNetClassifier';
 import StressIndexMeter from './components/AudioPipeline/StressIndexMeter';
 
-// Dashboard panels (Phase 0 — already built, imported from feature branch)
-// import IncubatorMap  from './components/Dashboard/IncubatorMap';
-import AlertFeed     from './components/Dashboard/AlertFeed';
-// import ShiftReport   from './components/Dashboard/ShiftReport';
+// Phase 2 — Agent Alerts
+import AlertFeed from './components/Dashboard/AlertFeed';
+
+// Phase 3 — Visual Pipeline
+import CameraCapture    from './components/VisualPipeline/CameraCapture';
+import OccupancyCounter from './components/VisualPipeline/OccupancyCounter';
+import MotionDetector   from './components/VisualPipeline/MotionDetector';
+import NurseTracker     from './components/VisualPipeline/NurseTracker';
+
+// Phase 4 — Parent Presence + Shift Memory
+import ParentPresenceChart from './components/Dashboard/ParentPresenceChart';
+import ShiftReport         from './components/Dashboard/ShiftReport';
 
 const MONITORED_BAY = 'BAY_03';
 
 export default function App() {
+  // Audio state
   const [stressData, setStressData] = useState({
     stressIndex:     0,
     classifications: { cry: 0, alarm: 0, ambient: 0 },
     dbLevel:         0,
     trend:           'stable',
   });
-
-  // History ring buffer (last 60 readings = 30 seconds at 500ms)
   const [history, setHistory] = useState([]);
+
+  // Visual state
+  const [visualData, setVisualData] = useState({
+    personCount:  0,
+    nursePresent: false,
+    motionScore:  0,
+  });
 
   const handleStressUpdate = useCallback((data) => {
     setStressData(data);
     setHistory(prev => [...prev.slice(-59), data.stressIndex]);
+  }, []);
+
+  const handleVisualUpdate = useCallback((data) => {
+    setVisualData(data);
   }, []);
 
   return (
@@ -49,7 +66,7 @@ export default function App() {
 
       {/* header */}
       <header style={{ background:'#ffffff', borderBottom:'1px solid #e2e8f0' }}>
-        <div style={{ maxWidth:1100, margin:'0 auto', padding:'0 16px', height:56,
+        <div style={{ maxWidth:1200, margin:'0 auto', padding:'0 16px', height:56,
                       display:'flex', alignItems:'center', justifyContent:'space-between' }}>
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
             <div style={{ width:34, height:34, borderRadius:10,
@@ -64,9 +81,9 @@ export default function App() {
               <div style={{ fontSize:10, color:'#94a3b8' }}>AI Ward Monitor</div>
             </div>
             <div style={{ display:'flex', alignItems:'center', gap:5, padding:'3px 9px',
-                          borderRadius:999, background:'#ccfbf1', fontSize:11, color:'#0f766e',
+                          borderRadius:999, background:'#dcfce7', fontSize:11, color:'#15803d',
                           fontWeight:600, marginLeft:6 }}>
-              <span>● Phase 1 — Audio Pipeline</span>
+              <span>● All Phases Active</span>
             </div>
           </div>
 
@@ -77,19 +94,21 @@ export default function App() {
       </header>
 
       {/* body */}
-      <div style={{ maxWidth:1100, margin:'0 auto', padding:16 }}>
+      <div style={{ maxWidth:1200, margin:'0 auto', padding:16 }}>
 
-        {/* Phase 1 notice */}
+        {/* info banner */}
         <div style={{ background:'#eff6ff', border:'1px solid #bfdbfe', borderRadius:10,
                       padding:'10px 14px', marginBottom:16, fontSize:13, color:'#1d4ed8' }}>
-          <b>Phase 1 — Audio Pipeline</b> · Connect a microphone and click "Start capture" to begin
-          live stress monitoring. The dashboard will auto-connect to the backend via WebSocket.
+          <b>NICU Guardian</b> · Real-time AI neonatal monitoring. Start audio capture and camera
+          to begin live stress monitoring with autonomous agent alerts.
         </div>
 
-        {/* main layout */}
-        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(320px,1fr))', gap:16 }}>
+        {/* ═══════════════════════════════════════════════════════════════════
+            ROW 1: Audio + Stress Gauge
+            ═══════════════════════════════════════════════════════════════════ */}
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(320px,1fr))', gap:16, marginBottom:16 }}>
 
-          {/* left: controls */}
+          {/* left: audio controls */}
           <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
             <AudioCapture
               incubatorId={MONITORED_BAY}
@@ -100,8 +119,8 @@ export default function App() {
             />
           </div>
 
-          {/* right: live gauge + timeline */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {/* right: stress gauge + alerts */}
+          <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
             <StressIndexMeter
               value={stressData.stressIndex}
               history={history}
@@ -112,22 +131,41 @@ export default function App() {
           </div>
         </div>
 
-        {/* placeholder for upcoming phases */}
-        <div style={{ marginTop:16, display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(200px,1fr))', gap:12 }}>
-          {[
-            { phase:'Phase 2', label:'Groq Agents',    icon:'🧠', desc:'Escalation · Root Cause · Prediction' },
-            { phase:'Phase 3', label:'Visual Pipeline', icon:'📷', desc:'Occupancy · Agitation · TDOA · Nurse tracker' },
-            { phase:'Phase 4', label:'Parent + Shift',  icon:'📋', desc:'Parent presence · Shift Memory Agent' },
-          ].map(({ phase, label, icon, desc }) => (
-            <div key={phase} style={{ background:'#ffffff', borderRadius:12, padding:'14px 16px',
-                                      border:'1px dashed #cbd5e1', opacity:0.7 }}>
-              <div style={{ fontSize:18, marginBottom:6 }}>{icon}</div>
-              <div style={{ fontSize:11, color:'#0f766e', fontWeight:600 }}>{phase}</div>
-              <div style={{ fontSize:13, fontWeight:600, color:'#0f172a', margin:'2px 0' }}>{label}</div>
-              <div style={{ fontSize:11, color:'#94a3b8' }}>{desc}</div>
-            </div>
-          ))}
+        {/* ═══════════════════════════════════════════════════════════════════
+            ROW 2: Visual Pipeline
+            ═══════════════════════════════════════════════════════════════════ */}
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(320px,1fr))', gap:16, marginBottom:16 }}>
+
+          {/* left: camera feed */}
+          <CameraCapture
+            incubatorId={MONITORED_BAY}
+            onVisualUpdate={handleVisualUpdate}
+          />
+
+          {/* right: visual stats */}
+          <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+            <OccupancyCounter
+              personCount={visualData.personCount}
+              nursePresent={visualData.nursePresent}
+            />
+            <MotionDetector
+              motionScore={visualData.motionScore}
+              cryProb={stressData.classifications.cry}
+            />
+            <NurseTracker
+              nursePresent={visualData.nursePresent}
+            />
+          </div>
         </div>
+
+        {/* ═══════════════════════════════════════════════════════════════════
+            ROW 3: Parent Presence + Shift Report
+            ═══════════════════════════════════════════════════════════════════ */}
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(320px,1fr))', gap:16 }}>
+          <ParentPresenceChart incubatorId={MONITORED_BAY} />
+          <ShiftReport />
+        </div>
+
       </div>
     </div>
   );
