@@ -106,6 +106,34 @@ async def resolve(alert_id: str):
     return {"resolved": True}
 
 
+@router.post("/alerts/test")
+async def test_alert(bay: str = "BAY_03"):
+    """
+    Fire a sample alert through the full pipeline (MongoDB + WebSocket broadcast).
+    Useful for verifying the alert system works during demos.
+    """
+    from database.schemas import AlertType
+
+    alert = {
+        "type":          AlertType.ESCALATION,
+        "incubator_id":  bay,
+        "title":         f"⚠️ Bay {bay} — Test Alert",
+        "body":          (
+            f"This is a test alert for {bay}. "
+            "The alert system is working correctly. "
+            "Stress index simulated at 78/100 with elevated cry probability. "
+            "This alert was triggered manually for verification purposes."
+        ),
+        "severity":      "high",
+        "agent":         "test_manual",
+        "stress_index":  78.0,
+        "classifications": {"cry": 0.72, "alarm": 0.15, "ambient": 0.13},
+    }
+
+    alert_id = await push_alert(alert)
+    return {"alert_id": alert_id, "status": "Test alert pushed successfully"}
+
+
 # ── WebSocket: /ws/alerts (backend → dashboard) ──────────────────────────────
 
 @router.websocket("/ws/alerts")

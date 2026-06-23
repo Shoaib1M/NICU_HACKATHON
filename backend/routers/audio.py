@@ -33,6 +33,87 @@ _subscribers: Set[WebSocket] = set()
 # Per-bay motion score from visual pipeline (updated by visual router)
 _motion_scores: Dict[str, float] = {}
 
+# Per-bay cooldown for alarm-probability alerts (avoid spamming every 500ms)
+_last_alarm_alert: Dict[str, datetime] = {}
+ALARM_PROB_THRESHOLD = 0.60       # fire alert when alarm_prob exceeds this
+ALARM_ALERT_COOLDOWN_SECS = 30    # don't re-alert same bay within this window
+
+
+async def _fire_alarm_prob_alert(
+    bay: str, alarm_prob: float, stress: float, clf: dict
+) -> None:
+    """Push an alert when alarm probability exceeds threshold (with cooldown)."""
+    now = datetime.utcnow()
+    last = _last_alarm_alert.get(bay)
+    if last and (now - last).total_seconds() < ALARM_ALERT_COOLDOWN_SECS:
+        return  # still in cooldown
+
+    _last_alarm_alert[bay] = now
+
+    from routers.alerts import push_alert
+    from database.schemas import AlertType
+
+    await push_alert({
+        "type":          AlertType.ESCALATION,
+        "incubator_id":  bay,
+        "title":         f"🔔 Bay {bay} — High Alarm Detected ({alarm_prob:.0%})",
+        "body":          (
+            f"Equipment alarm probability has exceeded {ALARM_PROB_THRESHOLD:.0%} "
+            f"(currently {alarm_prob:.0%}). "
+            f"Current stress index: {stress:.0f}/100. "
+            f"Audio breakdown — Cry: {clf.get('cry', 0):.0%}, "
+            f"Alarm: {clf.get('alarm', 0):.0%}, "
+            f"Ambient: {clf.get('ambient', 0):.0%}. "
+            f"Please check equipment alarms at the bedside."
+        ),
+        "severity":      "high" if alarm_prob > 0.60 else "medium",
+        "agent":         "audio_alarm_detector",
+        "stress_index":  stress,
+        "classifications": clf,
+    })
+    print(f"🔔  Alarm probability alert: {bay} — alarm={alarm_prob:.0%}")
+
+
+# Per-bay cooldown for cry-probability alerts
+_last_cry_alert: Dict[str, datetime] = {}
+CRY_PROB_THRESHOLD = 0.60
+CRY_ALERT_COOLDOWN_SECS = 30
+
+
+async def _fire_cry_prob_alert(
+    bay: str, cry_prob: float, stress: float, clf: dict
+) -> None:
+    """Push an alert when cry probability exceeds threshold (with cooldown)."""
+    now = datetime.utcnow()
+    last = _last_cry_alert.get(bay)
+    if last and (now - last).total_seconds() < CRY_ALERT_COOLDOWN_SECS:
+        return  # still in cooldown
+
+    _last_cry_alert[bay] = now
+
+    from routers.alerts import push_alert
+    from database.schemas import AlertType
+
+    await push_alert({
+        "type":          AlertType.ESCALATION,
+        "incubator_id":  bay,
+        "title":         f"😢 Bay {bay} — Infant Crying Detected ({cry_prob:.0%})",
+        "body":          (
+            f"Infant cry probability has exceeded {CRY_PROB_THRESHOLD:.0%} "
+            f"(currently {cry_prob:.0%}). "
+            f"Current stress index: {stress:.0f}/100. "
+            f"Audio breakdown — Cry: {clf.get('cry', 0):.0%}, "
+            f"Alarm: {clf.get('alarm', 0):.0%}, "
+            f"Ambient: {clf.get('ambient', 0):.0%}. "
+            f"Immediate bedside assessment recommended."
+        ),
+        "severity":      "high" if cry_prob > 0.75 else "medium",
+        "agent":         "audio_cry_detector",
+        "stress_index":  stress,
+        "classifications": clf,
+    })
+    print(f"😢  Cry probability alert: {bay} — cry={cry_prob:.0%}")
+
 
 def get_accumulator(bay: str) -> StressIndexAccumulator:
     if bay not in _accumulators:
@@ -140,6 +221,18 @@ async def audio_ingest(ws: WebSocket) -> None:
                     db_level=db_level,
                 )
             )
+
+            # ── Direct alarm-probability alert (fires when alarm > 60%) ───
+            if alarm_prob > 0.60:
+                asyncio.create_task(
+                    _fire_alarm_prob_alert(bay, alarm_prob, smoothed, clf)
+                )
+
+            # ── Direct cry-probability alert (fires when cry > 60%) ───
+            if cry_prob > 0.60:
+                asyncio.create_task(
+                    _fire_cry_prob_alert(bay, cry_prob, smoothed, clf)
+                )
 
     except WebSocketDisconnect:
         print(f"🎙️  Audio WebSocket disconnected ({bay})")
