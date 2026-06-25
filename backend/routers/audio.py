@@ -17,6 +17,7 @@ from typing import Dict, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from services.stress_index import StressIndexAccumulator, compute_stress_index
+from services.alarm_fatigue import AlarmFatigueDetector
 from database.queries import insert_stress_event, insert_alert
 from agents.escalation_agent import escalation_agent
 
@@ -38,6 +39,9 @@ _last_alarm_alert: Dict[str, datetime] = {}
 ALARM_PROB_THRESHOLD = 0.60       # fire alert when alarm_prob exceeds this
 ALARM_ALERT_COOLDOWN_SECS = 30    # don't re-alert same bay within this window
 
+# Feature 5: Alarm Fatigue Detector for equipment alarms
+_alarm_fatigue = AlarmFatigueDetector(threshold=3, window_minutes=10)
+
 
 async def _fire_alarm_prob_alert(
     bay: str, alarm_prob: float, stress: float, clf: dict
@@ -52,6 +56,23 @@ async def _fire_alarm_prob_alert(
 
     from routers.alerts import push_alert
     from database.schemas import AlertType
+
+    # Feature 5: Check for alarm fatigue
+    fatigue = _alarm_fatigue.check_and_consolidate(bay, "equipment_alarm", stress)
+
+    if fatigue:
+        await push_alert({
+            "type":          AlertType.ALARM_FATIGUE,
+            "incubator_id":  bay,
+            "title":         f"⚡ Bay {bay} — Alarm Fatigue ({fatigue['count']}× in 10 min)",
+            "body":          f"Equipment alarm fired {fatigue['count']}× in 10 min, no stress recovery — possible sensor drift on {bay}.",
+            "severity":      "medium",
+            "agent":         "audio_alarm_detector_fatigue",
+            "stress_index":  stress,
+            "classifications": clf,
+        })
+        print(f"⚡  Alarm fatigue alert: {bay} ({fatigue['count']}× repeats)")
+        return
 
     await push_alert({
         "type":          AlertType.ESCALATION,
@@ -185,6 +206,9 @@ async def audio_ingest(ws: WebSocket) -> None:
             acc        = get_accumulator(bay)
             smoothed   = acc.push(raw_stress)
             trend      = acc.trend
+            
+            if smoothed < 40:
+                _alarm_fatigue.note_recovery(bay)
 
             # ── Persist to MongoDB (non-blocking) ────────────────────────────
             event = {

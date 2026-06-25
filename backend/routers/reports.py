@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks
 
 from agents.shift_memory_agent import shift_memory_agent
 from services.parent_presence import get_parent_presence_stats
+from services.nurse_tracker import nurse_tracker
 from database.queries import get_latest_shift_report
 
 router = APIRouter()
@@ -77,3 +78,16 @@ async def parent_presence(bay: str = "BAY_03", minutes: int = 480):
     """Get parent presence correlation statistics for a bay."""
     stats = await get_parent_presence_stats(bay, minutes)
     return stats
+
+@router.get("/nurse-stats")
+async def get_nurse_stats(bay: str = "BAY_03"):
+    """Get live nurse response tracking stats."""
+    pending = nurse_tracker.has_pending(bay)
+    alert_time = nurse_tracker._pending.get(bay)
+    
+    return {
+        "pending_alert": pending,
+        "alert_started_at": alert_time.isoformat() if alert_time else None,
+        "avg_response_secs": nurse_tracker.get_avg_response_time(),
+        "total_responses": nurse_tracker.get_response_count()
+    }

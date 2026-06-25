@@ -118,9 +118,9 @@ class EscalationLoopAgent:
     timing and only calls Groq on level transitions.
     """
 
-    # Thresholds
-    STRESS_CRITICAL    = 40      # lowered for demo — alerts trigger sooner
-    INITIAL_DELAY_SECS = 5       # seconds of sustained stress before Level 1
+    # Thresholds (BUG 2b FIX)
+    STRESS_CRITICAL    = 70      # triggers alert if sustained
+    INITIAL_DELAY_SECS = 10      # seconds of sustained stress before Level 1
     ESCALATION_DELAY   = 90      # seconds between escalation levels
 
     def __init__(self) -> None:
@@ -179,6 +179,9 @@ class EscalationLoopAgent:
         # ── nurse arrived → resolve and reset ────────────────────────────────
         if nurse_present and state.level >= 1:
             print(f"👩‍⚕️  Nurse detected at {bay} — resolving escalation (L{state.level})")
+            if state.last_alert_id:
+                from database.queries import resolve_alert
+                asyncio.create_task(resolve_alert(state.last_alert_id))
             state.reset()
             return None
 
@@ -222,6 +225,10 @@ class EscalationLoopAgent:
         state.level_changed_at = now
         state.last_alert_id = alert_id
 
+        # ── Feature 10: start nurse response timer ───────────────────────────
+        from services.nurse_tracker import nurse_tracker
+        nurse_tracker.alert_raised(bay, now)
+
         # ── trigger root cause analysis on Level 1 ───────────────────────────
         if target_level == 1:
             asyncio.create_task(self._run_root_cause(bay, smoothed_stress, clf))
@@ -261,8 +268,11 @@ class EscalationLoopAgent:
             since_l1=since_l1,
         )
 
+        # Fallback message (BUG 2b FIX)
+        fallback_msg = f"Stress index {stress:.0f} sustained for {elapsed:.0f}s in {bay} — nurse attention required."
+
         # Call Groq for a natural-language alert body
-        body = await self._call_groq(user_prompt)
+        body = await self._call_groq(user_prompt, fallback_msg)
 
         title = config["title_tpl"].format(bay=bay)
 
@@ -337,10 +347,10 @@ class EscalationLoopAgent:
 
     # ── Groq wrapper with graceful fallback ──────────────────────────────────
 
-    async def _call_groq(self, user_prompt: str) -> str:
+    async def _call_groq(self, user_prompt: str, fallback_msg: str) -> str:
         """
-        Call Groq for alert text. Falls back to a static message if
-        the API key is missing or the call fails.
+        Call Groq for alert text. Falls back to a deterministic template if
+        the API key is missing or the call fails (BUG 2b FIX).
         """
         try:
             from utils.groq_client import chat
@@ -353,16 +363,10 @@ class EscalationLoopAgent:
         except RuntimeError as exc:
             # GROQ_API_KEY not set
             print(f"⚠️  Groq unavailable: {exc}")
-            return (
-                "AI analysis unavailable — API key not configured. "
-                "Critical stress detected. Immediate bedside assessment recommended."
-            )
+            return f"AI analysis unavailable. {fallback_msg}"
         except Exception as exc:
             print(f"⚠️  Groq call failed: {exc}")
-            return (
-                "AI analysis temporarily unavailable. "
-                "Critical stress detected. Please assess the infant immediately."
-            )
+            return f"AI analysis temporarily unavailable. {fallback_msg}"
 
 
 # ── module-level singleton ───────────────────────────────────────────────────

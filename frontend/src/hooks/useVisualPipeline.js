@@ -1,18 +1,30 @@
 /**
  * useVisualPipeline.js — NICU Guardian (Phase 3)
  *
- * Orchestrates the camera-based visual analysis loop:
+ * TWO-ZONE ARCHITECTURE (BUG 1 FIX):
+ * ═══════════════════════════════════
  *
- *  1. Request webcam via getUserMedia({ video: true })
- *  2. Load MediaPipe PoseLandmarker (lite model via CDN WASM)
- *  3. Every ~1 second:
- *       a. Run pose detection on current video frame
- *       b. Count distinct skeletons → personCount
- *       c. Heuristic nurse detection → nursePresent
- *       d. Compute motionScore from frame-to-frame pixel variance
- *       e. Build skeleton positions array
- *       f. Send visual_frame to backend via /ws/visual
- *  4. Expose { personCount, nursePresent, motionScore, skeletons, isRunning, start, stop, videoRef, canvasRef }
+ *  ┌─────────────────────────────────────────────┐
+ *  │               CAMERA FRAME                  │
+ *  │                                             │
+ *  │   ┌─── PERSON ZONE ──────────────────┐      │
+ *  │   │ MediaPipe Pose skeletons here    │      │
+ *  │   │ = nurses, visitors, staff        │      │
+ *  │   │                                  │      │
+ *  │   │   ┌─── INFANT ZONE ──────┐      │      │
+ *  │   │   │ Pixel-variance only  │      │      │
+ *  │   │   │ = incubator region   │      │      │
+ *  │   │   │ NO skeletons used    │      │      │
+ *  │   │   └──────────────────────┘      │      │
+ *  │   └──────────────────────────────────┘      │
+ *  └─────────────────────────────────────────────┘
+ *
+ *  - Infant motion = pixel variance INSIDE the incubator bounding box ONLY.
+ *    The infant is too small for MediaPipe Pose. Pure frame-differencing.
+ *  - Person/nurse = MediaPipe Pose skeletons OUTSIDE the incubator box,
+ *    with minimum height threshold (must be a standing adult).
+ *  - These are MUTUALLY EXCLUSIVE: a person standing near the incubator
+ *    produces personCount +1, nursePresent = true, but ZERO infant motion.
  *
  * Visual frame schema (matches VisualFrame in backend/database/schemas.py):
  * {
@@ -29,18 +41,56 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useWebSocket } from './useWebSocket';
 
-// ── constants ─────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// CONFIGURABLE ZONES — Adjust these during demo calibration!
+// All coordinates are NORMALIZED [0, 1] relative to the camera frame.
+// ══════════════════════════════════════════════════════════════════════════════
 
-const ANALYSIS_INTERVAL_MS = 1000;  // run pose detection every 1s
-const NURSE_ZONE_Y_MIN     = 0.2;   // nurse must have upper body in this Y range
-const NURSE_ZONE_Y_MAX     = 0.8;
-const MAX_OCCUPANCY        = 6;     // NICU guideline
+/**
+ * INFANT ZONE (incubator bounding box)
+ * Only pixel-variance motion inside this box counts as infant motion.
+ * Adjust x, y, w, h to match where the incubator appears in your camera feed.
+ */
+const INFANT_BOX = {
+  x: 0.3,   // left edge of incubator (30% from left)
+  y: 0.6,   // top edge of incubator (moved down to 60% from top for desk testing)
+  w: 0.4,   // width of incubator region (40% of frame)
+  h: 0.35,  // height of incubator region
+};
+
+/**
+ * PERSON ZONE constraints
+ * A MediaPipe skeleton must satisfy ALL of these to count as a person:
+ *  - Torso midpoint (avg of shoulders + hips) must be OUTSIDE the infant box
+ *  - Skeleton bounding-box height must exceed MIN_PERSON_HEIGHT (standing adult)
+ */
+const MIN_PERSON_HEIGHT = 0.25;    // reduced to 25% for desk testing
+const MIN_SKELETON_CONFIDENCE = 0.5; // minimum average landmark confidence
+
+// ── other constants ──────────────────────────────────────────────────────────
+
+const ANALYSIS_INTERVAL_MS = 1000;  // run analysis every 1s
 
 // MediaPipe Tasks Vision CDN paths
 const VISION_WASM_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm';
 const POSE_MODEL_URL  = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task';
 
-// ── hook ──────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER: check if a point is inside the infant bounding box
+// ══════════════════════════════════════════════════════════════════════════════
+
+function isInsideInfantBox(x, y) {
+  return (
+    x >= INFANT_BOX.x &&
+    x <= INFANT_BOX.x + INFANT_BOX.w &&
+    y >= INFANT_BOX.y &&
+    y <= INFANT_BOX.y + INFANT_BOX.h
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HOOK
+// ══════════════════════════════════════════════════════════════════════════════
 
 export function useVisualPipeline(incubatorId = 'BAY_03') {
   const [personCount,  setPersonCount]  = useState(0);
@@ -56,7 +106,7 @@ export function useVisualPipeline(incubatorId = 'BAY_03') {
   const streamRef     = useRef(null);
   const landmarkerRef = useRef(null);
   const timerRef      = useRef(null);
-  const prevFrameRef  = useRef(null); // for motion detection
+  const prevInfantRef = useRef(null); // previous frame's infant-zone pixels (for motion)
 
   // WebSocket to backend /ws/visual
   const { send: sendFrame } = useWebSocket('/ws/visual', () => {}, true);
@@ -78,7 +128,7 @@ export function useVisualPipeline(incubatorId = 'BAY_03') {
             delegate: 'GPU',
           },
           runningMode: 'VIDEO',
-          numPoses: 10,            // detect up to 10 people
+          numPoses: 10,
           minPoseDetectionConfidence: 0.5,
           minTrackingConfidence: 0.5,
         });
@@ -89,7 +139,6 @@ export function useVisualPipeline(incubatorId = 'BAY_03') {
         }
       } catch (err) {
         console.error('MediaPipe load error:', err);
-        // Fallback: continue without pose detection (motion-only mode)
       }
     }
 
@@ -97,129 +146,191 @@ export function useVisualPipeline(incubatorId = 'BAY_03') {
     return () => { cancelled = true; };
   }, []);
 
-  // ── per-interval analysis ──────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  // PER-INTERVAL ANALYSIS — the core two-zone logic
+  // ══════════════════════════════════════════════════════════════════════════
   const analyse = useCallback(() => {
     if (!videoRef.current || videoRef.current.readyState < 2) return;
 
     const video  = videoRef.current;
     const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    // ── 1. Pose detection ─────────────────────────────────────────────────
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const W = canvas.width;
+    const H = canvas.height;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ZONE 1: INFANT MOTION — pixel variance INSIDE the incubator box ONLY
+    // No MediaPipe skeletons. Pure frame-differencing.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const ix = Math.round(INFANT_BOX.x * W);
+    const iy = Math.round(INFANT_BOX.y * H);
+    const iw = Math.round(INFANT_BOX.w * W);
+    const ih = Math.round(INFANT_BOX.h * H);
+
+    let motion = 0;
+    const infantRegion = ctx.getImageData(ix, iy, iw, ih);
+    const infantData   = infantRegion.data;
+
+    if (prevInfantRef.current && prevInfantRef.current.length === infantData.length) {
+      let totalDiff = 0;
+      const pixelCount = infantData.length / 4;
+      for (let i = 0; i < infantData.length; i += 4) {
+        totalDiff += Math.abs(infantData[i]     - prevInfantRef.current[i]);     // R
+        totalDiff += Math.abs(infantData[i + 1] - prevInfantRef.current[i + 1]); // G
+        totalDiff += Math.abs(infantData[i + 2] - prevInfantRef.current[i + 2]); // B
+      }
+      // Normalise to [0, 1] with a sensitivity multiplier
+      motion = Math.min(1, totalDiff / (pixelCount * 255 * 3) * 10);
+    }
+    prevInfantRef.current = new Uint8ClampedArray(infantData);
+    motion = +motion.toFixed(3);
+    setMotionScore(motion);
+
+    // Draw the infant zone box on canvas (teal dashed rectangle)
+    ctx.strokeStyle = '#0f766e';
+    ctx.lineWidth   = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(ix, iy, iw, ih);
+    ctx.setLineDash([]);
+    ctx.font      = '11px system-ui';
+    ctx.fillStyle = '#0f766e';
+    ctx.fillText(`🍼 Infant Zone (motion: ${(motion * 100).toFixed(0)}%)`, ix + 4, iy - 6);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ZONE 2: PERSON / NURSE DETECTION — MediaPipe skeletons OUTSIDE infant box
+    // Only standing adults with sufficient height count as people.
+    // ═══════════════════════════════════════════════════════════════════════
+
     let poses = [];
     if (landmarkerRef.current) {
       try {
         const result = landmarkerRef.current.detectForVideo(video, performance.now());
         poses = result.landmarks || [];
       } catch (err) {
-        // Pose detection can fail on some frames — skip silently
+        // Pose detection can fail on some frames
       }
     }
 
-    // ── 2. Person count ───────────────────────────────────────────────────
-    const count = poses.length;
-    setPersonCount(count);
+    let validPersonCount = 0;
+    let nurseDetected    = false;
+    const validSkels     = [];
 
-    // ── 3. Skeleton positions (for WebSocket + drawing) ───────────────────
-    const skels = poses.map((landmarks) => {
-      // Use nose landmark (index 0) as representative position
-      const nose = landmarks[0];
-      return {
-        x: +(nose?.x ?? 0).toFixed(3),
-        y: +(nose?.y ?? 0).toFixed(3),
-        confidence: +(nose?.visibility ?? 0).toFixed(2),
-      };
-    });
-    setSkeletons(skels);
+    poses.forEach((landmarks, poseIdx) => {
+      // Calculate torso midpoint (average of shoulders + hips)
+      const lShoulder = landmarks[11];
+      const rShoulder = landmarks[12];
+      const lHip      = landmarks[23];
+      const rHip      = landmarks[24];
 
-    // ── 4. Nurse detection heuristic ──────────────────────────────────────
-    // A "nurse" is someone with confident upper-body landmarks in the bay zone
-    const nurse = poses.some((landmarks) => {
-      const nose       = landmarks[0];
-      const lShoulder  = landmarks[11];
-      const rShoulder  = landmarks[12];
-      if (!nose || !lShoulder || !rShoulder) return false;
+      if (!lShoulder || !rShoulder || !lHip || !rHip) return;
 
-      const avgConfidence = ((nose.visibility || 0) + (lShoulder.visibility || 0) + (rShoulder.visibility || 0)) / 3;
-      const inZone = nose.y > NURSE_ZONE_Y_MIN && nose.y < NURSE_ZONE_Y_MAX;
+      const torsoX = (lShoulder.x + rShoulder.x + lHip.x + rHip.x) / 4;
+      const torsoY = (lShoulder.y + rShoulder.y + lHip.y + rHip.y) / 4;
 
-      return avgConfidence > 0.6 && inZone;
-    });
-    setNursePresent(nurse);
+      // Calculate skeleton bounding-box height
+      const allY = landmarks.map(lm => lm.y).filter(y => y > 0);
+      const skelHeight = Math.max(...allY) - Math.min(...allY);
 
-    // ── 5. Motion score (pixel variance between frames) ───────────────────
-    let motion = 0;
-    if (canvas) {
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      canvas.width  = video.videoWidth  || 320;
-      canvas.height = video.videoHeight || 240;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      // Average confidence of key landmarks
+      const avgConf = (
+        (lShoulder.visibility || 0) +
+        (rShoulder.visibility || 0) +
+        (lHip.visibility || 0) +
+        (rHip.visibility || 0)
+      ) / 4;
 
-      const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data  = frame.data;
+      // ── ZONE CHECK: Is this skeleton a valid person? ──────────────────
+      const torsoInsideInfantBox = isInsideInfantBox(torsoX, torsoY);
+      const isTallEnough         = skelHeight >= MIN_PERSON_HEIGHT;
+      const isConfident          = avgConf >= MIN_SKELETON_CONFIDENCE;
 
-      if (prevFrameRef.current && prevFrameRef.current.length === data.length) {
-        // Compute mean absolute difference across all pixels (R,G,B channels)
-        let totalDiff = 0;
-        const pixelCount = data.length / 4;
-        for (let i = 0; i < data.length; i += 4) {
-          totalDiff += Math.abs(data[i]     - prevFrameRef.current[i]);     // R
-          totalDiff += Math.abs(data[i + 1] - prevFrameRef.current[i + 1]); // G
-          totalDiff += Math.abs(data[i + 2] - prevFrameRef.current[i + 2]); // B
-        }
-        // Normalise to [0, 1] — 255 * 3 is max possible diff per pixel
-        motion = Math.min(1, totalDiff / (pixelCount * 255 * 3) * 10);
+      // Log the zone decision for each skeleton (helps debug during demo)
+      console.log(
+        `👤 Pose ${poseIdx}: torso=(${torsoX.toFixed(2)},${torsoY.toFixed(2)}) ` +
+        `height=${skelHeight.toFixed(2)} conf=${avgConf.toFixed(2)} ` +
+        `inInfantBox=${torsoInsideInfantBox} tall=${isTallEnough} → ` +
+        `${(!torsoInsideInfantBox && isTallEnough && isConfident) ? '✅ PERSON' : '❌ IGNORED'}`
+      );
+
+      if (torsoInsideInfantBox) {
+        // Skeleton is inside the infant box — this is NOT a person,
+        // it's likely a misdetection on the infant. IGNORE for person count.
+        return;
       }
-      prevFrameRef.current = new Uint8ClampedArray(data);
-    }
-    motion = +motion.toFixed(3);
-    setMotionScore(motion);
 
-    // ── 6. Draw skeleton overlay ──────────────────────────────────────────
-    if (canvas && poses.length > 0) {
-      const ctx = canvas.getContext('2d');
-      const w = canvas.width;
-      const h = canvas.height;
+      if (!isTallEnough) {
+        // Skeleton is too small — not a standing adult. IGNORE.
+        return;
+      }
 
-      // Draw connections for each pose
-      poses.forEach((landmarks) => {
-        // Draw key joints as circles
-        const keypoints = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
-        ctx.fillStyle = '#0f766e';
-        keypoints.forEach((idx) => {
-          const lm = landmarks[idx];
-          if (lm && (lm.visibility || 0) > 0.5) {
-            ctx.beginPath();
-            ctx.arc(lm.x * w, lm.y * h, 4, 0, 2 * Math.PI);
-            ctx.fill();
-          }
-        });
+      if (!isConfident) {
+        // Low confidence — unreliable detection. IGNORE.
+        return;
+      }
 
-        // Draw bones
-        const bones = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
-        ctx.strokeStyle = '#0891b2';
-        ctx.lineWidth = 2;
-        bones.forEach(([a, b]) => {
-          const la = landmarks[a];
-          const lb = landmarks[b];
-          if (la && lb && (la.visibility || 0) > 0.4 && (lb.visibility || 0) > 0.4) {
-            ctx.beginPath();
-            ctx.moveTo(la.x * w, la.y * h);
-            ctx.lineTo(lb.x * w, lb.y * h);
-            ctx.stroke();
-          }
-        });
+      // ── Valid person detected OUTSIDE the infant box ───────────────────
+      validPersonCount++;
+      nurseDetected = true; // any person near the bay is treated as nurse/staff
+
+      validSkels.push({
+        x: +torsoX.toFixed(3),
+        y: +torsoY.toFixed(3),
+        confidence: +avgConf.toFixed(2),
       });
-    }
 
-    // ── 7. Send visual frame to backend ───────────────────────────────────
+      // Draw skeleton on canvas (person zone)
+      ctx.fillStyle = '#0f766e';
+      const nose = landmarks[0];
+      if (nose) {
+        ctx.beginPath();
+        ctx.arc(nose.x * W, nose.y * H, 6, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.font      = '12px system-ui';
+        ctx.fillStyle = '#0f766e';
+        ctx.fillText(`Person ${validPersonCount}`, nose.x * W + 10, nose.y * H - 5);
+      }
+
+      // Draw bones
+      const bones = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+      ctx.strokeStyle = '#0891b2';
+      ctx.lineWidth = 2;
+      bones.forEach(([a, b]) => {
+        const la = landmarks[a];
+        const lb = landmarks[b];
+        if (la && lb && (la.visibility || 0) > 0.4 && (lb.visibility || 0) > 0.4) {
+          ctx.beginPath();
+          ctx.moveTo(la.x * W, la.y * H);
+          ctx.lineTo(lb.x * W, lb.y * H);
+          ctx.stroke();
+        }
+      });
+    });
+
+    setPersonCount(validPersonCount);
+    setNursePresent(nurseDetected);
+    setSkeletons(validSkels);
+
+    console.log(
+      `📷 Frame: persons=${validPersonCount} nurse=${nurseDetected} ` +
+      `infantMotion=${motion.toFixed(3)} (poses raw=${poses.length})`
+    );
+
+    // ── Send visual frame to backend ─────────────────────────────────────
     sendFrame({
       type:                'visual_frame',
       timestamp:           new Date().toISOString(),
       incubator_id:        incubatorId,
-      person_count:        count,
-      nurse_present:       nurse,
+      person_count:        validPersonCount,
+      nurse_present:       nurseDetected,
       infant_motion_score: motion,
-      skeleton_positions:  skels,
+      skeleton_positions:  validSkels,
     });
 
   }, [incubatorId, sendFrame]);
@@ -242,7 +353,8 @@ export function useVisualPipeline(incubatorId = 'BAY_03') {
 
       setIsRunning(true);
       timerRef.current = setInterval(analyse, ANALYSIS_INTERVAL_MS);
-      console.log('📷  Visual pipeline started —', incubatorId);
+      console.log('📷 Visual pipeline started —', incubatorId);
+      console.log('📷 Infant zone:', INFANT_BOX);
 
     } catch (err) {
       const msg = err.name === 'NotAllowedError'
@@ -258,13 +370,13 @@ export function useVisualPipeline(incubatorId = 'BAY_03') {
     clearInterval(timerRef.current);
     streamRef.current?.getTracks().forEach(t => t.stop());
     if (videoRef.current) videoRef.current.srcObject = null;
-    prevFrameRef.current = null;
+    prevInfantRef.current = null;
     setIsRunning(false);
     setPersonCount(0);
     setMotionScore(0);
     setNursePresent(false);
     setSkeletons([]);
-    console.log('📷  Visual pipeline stopped');
+    console.log('📷 Visual pipeline stopped');
   }, []);
 
   // Cleanup on unmount

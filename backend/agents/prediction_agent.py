@@ -228,7 +228,9 @@ class PredictionAgent:
             threshold=CRITICAL_THRESHOLD,
         )
 
-        body = await self._call_groq(user_prompt)
+        fallback_msg = f"Stress in {bay} projected to reach {projected:.0f} in ~{PROJECTION_MINUTES} min — pre-emptive check recommended."
+
+        body = await self._call_groq(user_prompt, fallback_msg)
 
         eta_str = f"{eta_minutes:.0f}min" if eta_minutes > 0 else "imminent"
 
@@ -253,7 +255,7 @@ class PredictionAgent:
 
     # ── Groq wrapper with fallback ───────────────────────────────────────────
 
-    async def _call_groq(self, user_prompt: str) -> str:
+    async def _call_groq(self, user_prompt: str, fallback_msg: str) -> str:
         """Call Groq for early-warning text, with graceful fallback."""
         try:
             from utils.groq_client import chat
@@ -265,17 +267,10 @@ class PredictionAgent:
             )
         except RuntimeError as exc:
             print(f"⚠️  Groq unavailable for prediction: {exc}")
-            return (
-                "AI analysis unavailable — API key not configured. "
-                "Stress trend analysis indicates rising trajectory. "
-                "Proactive assessment recommended."
-            )
+            return f"AI analysis unavailable. {fallback_msg}"
         except Exception as exc:
             print(f"⚠️  Groq prediction call failed: {exc}")
-            return (
-                "AI analysis temporarily unavailable. "
-                "Stress trajectory is rising — proactive check recommended."
-            )
+            return f"AI analysis temporarily unavailable. {fallback_msg}"
 
 
 # ── module-level singleton ───────────────────────────────────────────────────

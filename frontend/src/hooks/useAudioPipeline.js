@@ -79,6 +79,7 @@ export function useAudioPipeline(incubatorId = 'BAY_03') {
   // Data refs
   const pcmBuf        = useRef([]);   // rolling PCM buffer
   const smoothBuf     = useRef([]);   // stress smoothing buffer
+  const classBuf      = useRef([]);   // classification smoothing buffer
   const timerRef      = useRef(null);
 
   // Latest motion score from visual pipeline — updated externally via ref
@@ -101,19 +102,24 @@ export function useAudioPipeline(incubatorId = 'BAY_03') {
   const analyse = useCallback(async () => {
     if (!yamnetRef.current || !analyserRef.current) return;
 
-    // 1. dB level from AnalyserNode
-    const freqBin = new Uint8Array(analyserRef.current.frequencyBinCount);
-    analyserRef.current.getByteFrequencyData(freqBin);
-    const avgBin = freqBin.reduce((a, b) => a + b, 0) / freqBin.length;
-    const db = Math.round(20 + (avgBin / 255) * 45); // map [0,255] → [20,65]
-    setDbLevel(db);
-
-    // 2. Grab latest PCM chunk
+    // 1. Grab latest PCM chunk
     const pcm = Float32Array.from(pcmBuf.current.slice(-YAMNET_WIN));
     if (pcm.length < YAMNET_WIN) return; // buffer not full yet
 
+    // 2. dB level from real PCM RMS (BUG 2a FIX)
+    const rms = computeRMS(pcm);
+    const db = rmsToDB(rms);
+    setDbLevel(db);
+
     // 3. YAMNet inference
     const { scores, embeddings } = await runYAMNet(pcm, yamnetRef.current);
+
+    // BUG 2a FIX: Log raw top-5 AudioSet class scores so we can see what it detects
+    const top5 = Array.from(scores)
+      .map((score, index) => ({ index, score }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+    console.log(`🎙️ YAMNet Top 5:`, top5.map(t => `#${t.index} (${(t.score*100).toFixed(1)}%)`).join(' | '));
 
     // 4. Class probabilities — prefer fine-tuned classifier if available
     let clf = extractNICUClasses(scores);
@@ -128,17 +134,33 @@ export function useAudioPipeline(incubatorId = 'BAY_03') {
         };
       }
     }
-    setClassifications(clf);
+
+    // BUG 2a FIX: Smooth classifications over the last 4 frames
+    classBuf.current.push(clf);
+    if (classBuf.current.length > 4) classBuf.current.shift();
+    
+    const avgClf = { cry: 0, alarm: 0, ambient: 0 };
+    for (const c of classBuf.current) {
+      avgClf.cry += c.cry;
+      avgClf.alarm += c.alarm;
+      avgClf.ambient += c.ambient;
+    }
+    const bufLen = classBuf.current.length;
+    avgClf.cry = +(avgClf.cry / bufLen).toFixed(4);
+    avgClf.alarm = +(avgClf.alarm / bufLen).toFixed(4);
+    avgClf.ambient = +(avgClf.ambient / bufLen).toFixed(4);
+
+    setClassifications(avgClf);
 
     // 5. Stress index
-    const raw     = computeStressIndex({ dbLevel: db, cryProb: clf.cry, alarmProb: clf.alarm, ambientPenalty: clf.ambient, motionScore: motionRef.current });
+    const raw     = computeStressIndex({ dbLevel: db, cryProb: avgClf.cry, alarmProb: avgClf.alarm, ambientPenalty: avgClf.ambient, motionScore: motionRef.current });
     const smooth  = pushSmooth(smoothBuf.current, raw, SMOOTH_WIN);
     const t       = stressTrend(smoothBuf.current);
     setStressIndex(smooth);
     setTrend(t);
 
     // Feature 5 — alarm fatigue check (alarm class only)
-    if (clf.alarm > 0.3) {
+    if (avgClf.alarm > 0.3) {
       const fatigue = recordAlarm(incubatorId, 'alarm', smooth);
       if (fatigue) console.warn(`⚠️ Alarm fatigue detected — ${incubatorId}`);
     }
@@ -152,7 +174,7 @@ export function useAudioPipeline(incubatorId = 'BAY_03') {
       timestamp:           new Date().toISOString(),
       incubator_id:        incubatorId,
       db_level:            db,
-      classifications:     clf,
+      classifications:     avgClf,
       mic_channels:        [db],          // single-mic; expand for TDOA (F6)
       infant_motion_score: motionRef.current,
     });
@@ -212,6 +234,7 @@ export function useAudioPipeline(incubatorId = 'BAY_03') {
     audioCtxRef.current?.close();
     pcmBuf.current    = [];
     smoothBuf.current = [];
+    classBuf.current  = [];
     setIsRunning(false);
     setStressIndex(0);
     console.log('🎙️  Audio pipeline stopped');

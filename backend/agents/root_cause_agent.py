@@ -333,12 +333,45 @@ class RootCauseAgent:
             return choice.message.content.strip() if choice.message.content else None
 
         except RuntimeError as exc:
-            print(f"⚠️  Root cause agent — Groq unavailable: {exc}")
-            return (
-                "AI root cause analysis unavailable — API key not configured. "
-                "Manual investigation recommended: check audio classifications, "
-                "occupancy levels, and recent equipment alarms."
-            )
+            print(f"⚠️  Root cause agent — Groq unavailable: {exc}. Running deterministic fallback.")
+            try:
+                # Run deterministic rule-based fallback (Feature 3)
+                occ_history = await get_occupancy_history(bay, 10)
+                recent_alerts = await get_recent_alerts(bay, 10)
+                
+                high_occupancy = False
+                if occ_history:
+                    avg_count = sum(l.get("person_count", 0) for l in occ_history) / len(occ_history)
+                    if avg_count >= 3:
+                        high_occupancy = True
+                        
+                has_recent_alarm = False
+                if recent_alerts:
+                    # Ignore pure root_cause / prediction alerts
+                    for a in recent_alerts:
+                        if "alarm" in a.get("title", "").lower() or a.get("type") == "alarm_fatigue":
+                            has_recent_alarm = True
+                            break
+
+                cry_prob = classifications.get('cry', 0)
+                alarm_prob = classifications.get('alarm', 0)
+                
+                if cry_prob > 0.5 and high_occupancy and has_recent_alarm:
+                    return "Probable pain event: Sustained crying with high occupancy and recent equipment alarms."
+                elif alarm_prob > 0.5 and cry_prob < 0.3:
+                    return "Probable equipment alarm: High alarm noise detected with low infant crying."
+                elif cry_prob > 0.5 and high_occupancy:
+                    return "Probable overstimulation: High crying correlating with elevated visitor count."
+                elif cry_prob > 0.5 and has_recent_alarm:
+                    return "Probable distress following clinical event: Infant crying after a recent alarm."
+                elif cry_prob > 0.5:
+                    return "Probable infant distress: Sustained crying without equipment alarms or crowding."
+                else:
+                    return "Uncertain root cause: Stress elevated without clear dominant factors."
+                    
+            except Exception as fb_exc:
+                print(f"⚠️  Deterministic fallback failed: {fb_exc}")
+                return "Rule-based analysis failed due to database error."
         except Exception as exc:
             print(f"⚠️  Root cause agent error: {exc}")
             return None
